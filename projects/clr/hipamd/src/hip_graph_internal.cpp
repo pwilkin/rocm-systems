@@ -6,6 +6,8 @@
 
 #include "hip_graph_internal.hpp"
 
+#include <hsa/hsa.h>
+
 #define CASE_STRING(X, C)                                                                          \
   case X:                                                                                          \
     case_string = #C;                                                                              \
@@ -429,6 +431,106 @@ void GraphExecSegmented::BuildSyncPlan() {
       seg.needs_completion_signal = false;
     }
     collapsed_to_single_stream_ = true;
+  }
+
+  if (collapsed_to_single_stream_ && DEBUG_HIP_GRAPH_MERGE_COLLAPSED) {
+    std::vector<int> segment_order;
+    for (int level = 0; level <= max_dependency_level_; ++level) {
+      auto level_it = segments_per_level_.find(level);
+      if (level_it != segments_per_level_.end()) {
+        segment_order.insert(segment_order.end(), level_it->second.begin(), level_it->second.end());
+      }
+    }
+
+    bool can_merge = segment_order.size() == segments_.size();
+    for (int segment_id : segment_order) {
+      auto batch_it = segmentBatches_.find(segment_id);
+      if (segment_id < 0 || segment_id >= static_cast<int>(segments_.size()) ||
+          batch_it == segmentBatches_.end() || segments_[segment_id].child_graph_ptr != nullptr ||
+          batch_it->second.has_uncaptured_nodes || batch_it->second.packet_batches.size() != 1) {
+        can_merge = false;
+        break;
+      }
+    }
+
+    if (can_merge) {
+      Segment merged_segment;
+      merged_segment.id = 0;
+      merged_segment.dev_id = segments_.front().dev_id;
+      merged_segment.stream_id = 0;
+      merged_segment.dependency_level = 0;
+      SegmentBatch merged_segment_batch(0);
+      merged_segment_batch.packet_batches.emplace_back();
+      auto& merged_batch = merged_segment_batch.packet_batches.front();
+      bool needs_join = false;
+
+      for (size_t order_index = 0; order_index < segment_order.size(); ++order_index) {
+        const int segment_id = segment_order[order_index];
+        const auto& segment = segments_[segment_id];
+        auto& source_batch = segmentBatches_.find(segment_id)->second.packet_batches.front();
+        const size_t packet_base = merged_batch.dispatchPackets.size();
+        const size_t range_base = merged_batch.nodeRanges.size();
+
+        if (order_index != 0 && segment.segment_ids_dependencies.empty() &&
+            !source_batch.dispatchPackets.empty()) {
+          constexpr uint16_t kGraphBarrierBit = 1 << HSA_PACKET_HEADER_BARRIER;
+          uint16_t header = 0;
+          std::memcpy(&header, source_batch.dispatchPackets.front(), sizeof(header));
+          header &= ~kGraphBarrierBit;
+          std::memcpy(source_batch.dispatchPackets.front(), &header, sizeof(header));
+          needs_join = true;
+        }
+
+        merged_batch.dispatchPackets.insert(merged_batch.dispatchPackets.end(),
+                                            source_batch.dispatchPackets.begin(),
+                                            source_batch.dispatchPackets.end());
+        merged_batch.dispatchKernelNames.insert(merged_batch.dispatchKernelNames.end(),
+                                                source_batch.dispatchKernelNames.begin(),
+                                                source_batch.dispatchKernelNames.end());
+        merged_batch.dispatchMetadataPackets.insert(merged_batch.dispatchMetadataPackets.end(),
+                                                    source_batch.dispatchMetadataPackets.begin(),
+                                                    source_batch.dispatchMetadataPackets.end());
+        for (auto range : source_batch.nodeRanges) {
+          range.startIndex += packet_base;
+          merged_batch.nodeRanges.push_back(range);
+        }
+        for (const auto& [node, range_index] : source_batch.nodeToRangeIndex) {
+          merged_batch.nodeToRangeIndex[node] = range_base + range_index;
+        }
+        merged_batch.disabledNodeCount += source_batch.disabledNodeCount;
+
+        merged_segment.nodes.insert(merged_segment.nodes.end(), segment.nodes.begin(),
+                                    segment.nodes.end());
+        merged_segment_batch.node_capture_status.insert(
+            merged_segment_batch.node_capture_status.end(), segment.nodes.size(), true);
+      }
+
+      if (needs_join) {
+        uint8_t* join_barrier = device->CreateBarrierPacket();
+        sync_plan_.barrier_packets.push_back(join_barrier);
+        merged_batch.dispatchPackets.push_back(join_barrier);
+        merged_batch.dispatchKernelNames.push_back(nullptr);
+        merged_batch.dispatchMetadataPackets.push_back(nullptr);
+      }
+
+      merged_segment.first_node = merged_segment.nodes.front();
+      merged_segment.last_node = merged_segment.nodes.back();
+      segments_.clear();
+      segments_.push_back(std::move(merged_segment));
+      segmentBatches_.clear();
+      segmentBatches_.emplace(0, std::move(merged_segment_batch));
+      node_to_segment_id_.clear();
+      for (auto* node : segments_.front().nodes) {
+        node_to_segment_id_[node] = 0;
+        node->segment_id_ = 0;
+      }
+      segments_per_level_.clear();
+      segments_per_level_[0].push_back(0);
+      max_dependency_level_ = 0;
+      max_streams_ = 1;
+      sync_plan_.num_segments = 1;
+      sync_plan_.seg_to_hw_event.assign(1, -1);
+    }
   }
 
   // PASS 1: Assign a compact HW-event slot only to segments whose completion

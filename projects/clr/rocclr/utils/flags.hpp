@@ -245,6 +245,8 @@ release(uint, DEBUG_HIP_FORCE_GRAPH_QUEUES, 4,                                \
         "Forces the number of streams for the graph parallel execution")      \
 release(uint, DEBUG_HIP_GRAPH_BATCH_SIZE, 256,                                \
         "Number of graph nodes to batch at a time")                           \
+release(bool, DEBUG_HIP_GRAPH_MERGE_COLLAPSED, false,                         \
+        "Merge fully captured single-stream graph segments")                 \
 release(uint, DEBUG_HIP_GRAPH_SEGMENT_SCHEDULING, 0,                          \
         "Segment scheduling mode (segmented path only): "                      \
         "0=Hybrid/auto, 1=Round-robin, 2=DFS")                                \
