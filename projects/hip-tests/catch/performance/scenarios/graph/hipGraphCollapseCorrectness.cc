@@ -68,8 +68,8 @@ __global__ void k_add_value(int* value, int addend) { value[0] = value[0] + adde
 __global__ void k_atomic_increment(int* value) { atomicAdd(value, 1); }
 
 __global__ void k_private_increment(int* value, int selector) {
-  volatile int scratch[8];
-  const int slot = (selector + static_cast<int>(threadIdx.x)) & 7;
+  volatile int scratch[528];
+  const int slot = (selector + static_cast<int>(threadIdx.x)) % 528;
   scratch[slot] = value[0] + 1;
   if (threadIdx.x == 0) {
     value[0] = scratch[slot];
@@ -478,7 +478,7 @@ TEST_CASE("Performance_Graph_Pm4QueueScratch") {
   HIP_CHECK(hipFuncGetAttributes(&attributes,
                                  reinterpret_cast<const void*>(k_private_increment)));
   INFO("private bytes=" << attributes.localSizeBytes);
-  REQUIRE(attributes.localSizeBytes > 0);
+  REQUIRE(attributes.localSizeBytes >= 528 * sizeof(int));
 
   int* device_value = nullptr;
   HIP_CHECK(hipMalloc(&device_value, sizeof(*device_value)));

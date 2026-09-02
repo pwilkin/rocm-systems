@@ -151,19 +151,18 @@ TEST(GraphCommandEncoder, QueueScratchUsesPatchableTmpRingState) {
   EXPECT_EQ(gfx12.words()[gfx12.tmpring_patch_dword()], 0u);
 }
 
-TEST(GraphCommandEncoder, Gfx12WordsMatchRedline20474) {
-  constexpr std::array<uint32_t, 62> expected = {
+TEST(GraphCommandEncoder, Gfx12WordsUseGc120RegistersAndPairs) {
+  constexpr std::array<uint32_t, 55> expected = {
       0xc0065800, 0x00000000, 0xffffffff, 0x000000ff, 0x00000000, 0x00000000,
-      0x00000004, 0x00010180, 0xc0027602, 0x0000020c, 0x00000100, 0x00000000,
-      0xc0027602, 0x00000212, 0x00000011, 0x00000022, 0xc0017602, 0x00000223,
-      0x00000033, 0xc0017602, 0x00000216, 0x00000000, 0xc0037602, 0x00000207,
-      0x00000100, 0x00000001, 0x00000001, 0xc0017602, 0x00000215, 0x000003ff,
-      0xc0047602, 0x00000230, 0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff,
-      0xc0027602, 0x00000240, 0x9abcdef0, 0x12345678, 0xc0031502, 0x00000100,
-      0x00000001, 0x00000001, 0x00008025, 0xc0004600, 0x00000407, 0xc0065800,
-      0x00000000, 0xffffffff, 0x00ffffff, 0x00000000, 0x00000000, 0x0000000a,
-      0x00000380, 0xc0031502, 0x00000100, 0x00000001, 0x00000001, 0x00008025,
-      0xc0004600, 0x00000407,
+      0x00000004, 0x00010180, 0xc017ba02, 0x0000020c, 0x00000100, 0x0000020d,
+      0x00000000, 0x00000212, 0x00000011, 0x00000213, 0x00000022, 0x00000228,
+      0x00000033, 0x00000218, 0x00000000, 0x00000207, 0x00000100, 0x00000208,
+      0x00000001, 0x00000209, 0x00000001, 0x00000215, 0x000003ff, 0x00000240,
+      0x9abcdef0, 0x00000241, 0x12345678, 0xc0031502, 0x00000100, 0x00000001,
+      0x00000001, 0x00008025, 0xc0004600, 0x00000407, 0xc0065800, 0x00000000,
+      0xffffffff, 0x00ffffff, 0x00000000, 0x00000000, 0x0000000a, 0x00000380,
+      0xc0031502, 0x00000100, 0x00000001, 0x00000001, 0x00008025, 0xc0004600,
+      0x00000407,
   };
 
   rocr::graph::Gfx12CommandEncoder encoder;
@@ -214,7 +213,7 @@ TEST(GraphCommandEncoder, CapabilityTableCoversDeclaredGfx11AndGfx12Families) {
        {std::pair{0u, 0u}, std::pair{0u, 1u}, std::pair{5u, 0u}}) {
     const auto capability = rocr::graph::GetGraphCommandCapability(12, minor, stepping);
     EXPECT_EQ(capability.family, HSA_VEN_AMD_GRAPH_ENCODER_GFX12);
-    EXPECT_TRUE(capability.compile_supported);
+    EXPECT_EQ(capability.compile_supported, minor == 0);
     EXPECT_FALSE(capability.runtime_qualified);
   }
   const auto unsupported = rocr::graph::GetGraphCommandCapability(10, 3, 0);
@@ -238,8 +237,10 @@ TEST(GraphCommandEncoder, DynamicLdsIsEncodedAndOverflowRejected) {
   rocr::graph::Gfx12CommandEncoder gfx12;
   ASSERT_TRUE(gfx12.Append(packet, Image12(), 0,
                            HSA_VEN_AMD_GRAPH_DEPENDENCY_SAME_AGENT_RMW));
+  constexpr std::array<uint32_t, 4> expected_gfx12_rsrc = {
+      0x00000212, 0x00000011, 0x00000213, 0x00018022};
   const auto gfx12_rsrc = std::search(gfx12.words().begin(), gfx12.words().end(),
-                                      expected_rsrc.begin(), expected_rsrc.end());
+                                      expected_gfx12_rsrc.begin(), expected_gfx12_rsrc.end());
   EXPECT_NE(gfx12_rsrc, gfx12.words().end());
 
   packet.group_segment_size = UINT32_MAX;
