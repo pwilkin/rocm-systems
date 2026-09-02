@@ -29,7 +29,7 @@ inline GraphCommandCapability GetGraphCommandCapability(uint32_t major, uint32_t
     return {HSA_VEN_AMD_GRAPH_ENCODER_GFX11, true, minor == 5 && stepping == 1};
   }
   if (major == 12) {
-    return {HSA_VEN_AMD_GRAPH_ENCODER_GFX12, true, false};
+    return {HSA_VEN_AMD_GRAPH_ENCODER_GFX12, minor == 0, false};
   }
   return {HSA_VEN_AMD_GRAPH_ENCODER_NONE, false, false};
 }
@@ -290,19 +290,12 @@ class Gfx12CommandEncoder {
     SetShRegs(kComputePgmRsrc1, rsrc, 2);
     SetShRegs(kComputePgmRsrc3, &image.compute_pgm_rsrc3, 1);
     const uint32_t zero = 0;
-    const size_t tmpring_words_before = words_.size();
     SetShRegs(kComputeTmpRingSize, &zero, 1);
-    if (tmpring_patch_dword_ == kNoPatchDword && words_.size() != tmpring_words_before) {
-      tmpring_patch_dword_ = words_.size() - 1;
-    }
     const uint32_t workgroup[] = {packet.workgroup_size_x, packet.workgroup_size_y,
                                   packet.workgroup_size_z};
     SetShRegs(kComputeNumThreadX, workgroup, 3);
     const uint32_t resource_limits = 0x3ff;
     SetShRegs(kComputeResourceLimits, &resource_limits, 1);
-    const uint32_t static_thread_management[] = {UINT32_MAX, UINT32_MAX, UINT32_MAX,
-                                                 UINT32_MAX};
-    SetShRegs(kComputeStaticThreadMgmtSe0, static_thread_management, 4);
 
     if ((image.kernel_code_properties & kEnableSgprKernargSegmentPtr) != 0) {
       if (packet.kernarg_address == nullptr) {
@@ -313,6 +306,8 @@ class Gfx12CommandEncoder {
                                      static_cast<uint32_t>(kernarg >> 32)};
       SetShRegs(kComputeUserData0, user_sgprs, 2);
     }
+
+    FlushShRegs();
 
     const uint32_t dimensions[] = {packet.grid_size_x, packet.grid_size_y,
                                    packet.grid_size_z};
@@ -332,7 +327,7 @@ class Gfx12CommandEncoder {
   size_t tmpring_patch_dword() const { return tmpring_patch_dword_; }
 
  private:
-  static constexpr uint32_t kPacket3SetShReg = 0x76;
+  static constexpr uint32_t kPacket3SetShRegPairs = 0xba;
   static constexpr uint32_t kPacket3DispatchDirect = 0x15;
   static constexpr uint32_t kPacket3EventWrite = 0x46;
   static constexpr uint32_t kPacket3AcquireMem = 0x58;
@@ -340,9 +335,8 @@ class Gfx12CommandEncoder {
   static constexpr uint32_t kComputePgmLo = 0x20c;
   static constexpr uint32_t kComputePgmRsrc1 = 0x212;
   static constexpr uint32_t kComputeResourceLimits = 0x215;
-  static constexpr uint32_t kComputeTmpRingSize = 0x216;
-  static constexpr uint32_t kComputePgmRsrc3 = 0x223;
-  static constexpr uint32_t kComputeStaticThreadMgmtSe0 = 0x230;
+  static constexpr uint32_t kComputeTmpRingSize = 0x218;
+  static constexpr uint32_t kComputePgmRsrc3 = 0x228;
   static constexpr uint32_t kComputeUserData0 = 0x240;
   static constexpr uint32_t kLdsSizeMask = 0x00ff8000;
   static constexpr uint32_t kLdsSizeShift = 15;
@@ -382,38 +376,38 @@ class Gfx12CommandEncoder {
   }
 
   void SetShRegs(uint32_t first, const uint32_t* values, size_t count) {
-    size_t i = 0;
-    while (i < count) {
-      while (i < count) {
-        const uint32_t reg = first + static_cast<uint32_t>(i);
-        const auto it = register_state_.find(reg);
-        if (it == register_state_.end() || it->second != values[i]) {
-          break;
-        }
-        ++i;
-      }
-      if (i == count) {
-        break;
-      }
-      const size_t run_start = i;
-      while (i < count) {
-        const uint32_t reg = first + static_cast<uint32_t>(i);
-        const auto it = register_state_.find(reg);
-        if (it != register_state_.end() && it->second == values[i]) {
-          break;
-        }
+    for (size_t i = 0; i < count; ++i) {
+      const uint32_t reg = first + static_cast<uint32_t>(i);
+      const auto it = register_state_.find(reg);
+      if (it == register_state_.end() || it->second != values[i]) {
         register_state_[reg] = values[i];
-        ++i;
+        pending_registers_.push_back(reg);
+        pending_registers_.push_back(values[i]);
       }
-      const size_t run_count = i - run_start;
-      words_.push_back(Packet3(kPacket3SetShReg,
-                               1 + static_cast<uint32_t>(run_count), true));
-      words_.push_back(first + static_cast<uint32_t>(run_start));
-      words_.insert(words_.end(), values + run_start, values + run_start + run_count);
     }
   }
 
+  void FlushShRegs() {
+    if (pending_registers_.empty()) {
+      return;
+    }
+    const size_t header = words_.size();
+    words_.push_back(Packet3(kPacket3SetShRegPairs,
+                             static_cast<uint32_t>(pending_registers_.size()), true));
+    words_.insert(words_.end(), pending_registers_.begin(), pending_registers_.end());
+    if (tmpring_patch_dword_ == kNoPatchDword) {
+      for (size_t i = 0; i < pending_registers_.size(); i += 2) {
+        if (pending_registers_[i] == kComputeTmpRingSize) {
+          tmpring_patch_dword_ = header + i + 2;
+          break;
+        }
+      }
+    }
+    pending_registers_.clear();
+  }
+
   std::vector<uint32_t> words_;
+  std::vector<uint32_t> pending_registers_;
   std::map<uint32_t, uint32_t> register_state_;
   size_t dispatch_count_ = 0;
   static constexpr size_t kNoPatchDword = static_cast<size_t>(-1);
