@@ -1346,6 +1346,12 @@ class GraphExecSegmented : public GraphExecBase {
     std::unordered_map<GraphNode*, size_t> nodeToRangeIndex;  // O(1) lookup
     int disabledNodeCount = 0;  // Count of currently disabled nodes
     bool updatePending = false;
+    struct Pm4Cache {
+      std::mutex lock;
+      std::shared_ptr<amd::device::GraphPm4Batch> batch;
+      bool rejected = false;
+    };
+    std::shared_ptr<Pm4Cache> pm4Cache = std::make_shared<Pm4Cache>();
     // Standalone barrier reserved (at BuildSyncPlan) for the last batch of a
     // segment whose completion signal is embedded on its last kernel packet.
     // Only spliced into the *filtered* dispatch buffer by rebuildFilteredLists
@@ -2181,8 +2187,7 @@ class GraphKernelNode : public GraphNode {
     }
     launchFlags_ = kernelNode->launchFlags_;
     kernelEvents_ = kernelNode->kernelEvents_;
-    CopyAttr(kernelNode);
-    return status;
+    return CopyAttr(kernelNode);
   }
 
   hipError_t validateKernelParams(const hipKernelNodeParams* pNodeParams,

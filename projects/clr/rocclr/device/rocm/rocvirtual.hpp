@@ -740,6 +740,14 @@ class VirtualGPU : public device::VirtualDevice {
                                   bool blocking = false,
                                   const std::vector<uint8_t>* flatMetadataData = nullptr) override;
 
+  std::shared_ptr<amd::device::GraphPm4Batch> CreateGraphPm4Batch(
+      const amd::AlignedVector64<uint8_t>& flatPacketData,
+      const std::vector<uint32_t>& validFullHeaders) override;
+
+  bool DispatchGraphPm4Batch(const std::shared_ptr<amd::device::GraphPm4Batch>& batch,
+                             amd::AccumulateCommand* vcmd, bool attach_signal = false,
+                             bool blocking = false) override;
+
   template <typename AqlPacket> bool dispatchGenericAqlPacket(AqlPacket* packet, uint16_t header,
                                                               uint16_t rest, bool blocking,
                                                               bool attach_signal = false);

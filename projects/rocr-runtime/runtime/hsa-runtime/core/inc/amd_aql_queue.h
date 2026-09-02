@@ -43,6 +43,8 @@
 #ifndef HSA_RUNTIME_CORE_INC_AMD_HW_AQL_COMMAND_PROCESSOR_H_
 #define HSA_RUNTIME_CORE_INC_AMD_HW_AQL_COMMAND_PROCESSOR_H_
 
+#include <memory>
+
 #include "core/inc/runtime.h"
 #include "core/inc/signal.h"
 #include "core/inc/queue.h"
@@ -247,6 +249,11 @@ class AqlQueue : public core::Queue, private core::LocalSignal, public core::Doo
   /// larger than new limits, perform async-reclaim.
   void CheckScratchLimits();
 
+  hsa_status_t GetGraphScratchState(
+      uint32_t private_wave32, uint32_t private_wave64,
+      uint32_t* compute_tmpring_size,
+      std::shared_ptr<std::atomic<uint32_t>>* scratch_users);
+
   /// @brief Async reclaim main scratch memory
   void AsyncReclaimMainScratch();
 
@@ -374,6 +381,9 @@ class AqlQueue : public core::Queue, private core::LocalSignal, public core::Doo
   // Mutex to prevent AsyncReclaimScratch and HandleInsufficientScratch from
   // happening at the same time.
   std::mutex scratch_lock_;
+
+  std::shared_ptr<std::atomic<uint32_t>> retained_graph_scratch_ =
+      std::make_shared<std::atomic<uint32_t>>(0);
 
   // Current CU mask
   std::vector<uint32_t> cu_mask_;
