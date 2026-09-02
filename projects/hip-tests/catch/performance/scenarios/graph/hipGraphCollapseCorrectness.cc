@@ -47,6 +47,19 @@ __global__ void k_add(const int* x, const int* y, int* out, int n) {
   if (i < n) out[i] = x[i] + y[i];
 }
 
+__global__ void k_delay_set(int* output, int index, uint64_t count) {
+#if HT_AMD
+  const uint64_t start = wall_clock64();
+  while (wall_clock64() - start < count) {
+  }
+#else
+  const uint64_t start = clock64();
+  while (clock64() - start < count) {
+  }
+#endif
+  output[index] = 1;
+}
+
 hipGraphNode_t AddKernel(hipGraph_t graph, std::vector<hipGraphNode_t> deps,
                          void* func, std::vector<void*> args) {
   hipKernelNodeParams p{};
@@ -204,4 +217,54 @@ TEST_CASE("Performance_Graph_DisabledBoundarySynchronization") {
   HIP_CHECK(hipFree(b));
   HIP_CHECK(hipFree(c));
   HIP_CHECK(hipFree(out));
+}
+
+TEST_CASE("Performance_Graph_CollapsedIndependentCompletion") {
+  constexpr int kNodes = 32;
+  constexpr int kIterations = 20;
+  int clock_rate = 0;
+  hipDevice_t device = 0;
+  HIP_CHECK(hipGetDevice(&device));
+#if HT_AMD
+  HIP_CHECK(hipDeviceGetAttribute(&clock_rate, hipDeviceAttributeWallClockRate, device));
+#else
+  HIP_CHECK(hipDeviceGetAttribute(&clock_rate, hipDeviceAttributeClockRate, device));
+#endif
+  const uint64_t delay = static_cast<uint64_t>(clock_rate) / 2;
+
+  int* output = nullptr;
+  HIP_CHECK(hipMalloc(&output, kNodes * sizeof(int)));
+  hipGraph_t graph{};
+  HIP_CHECK(hipGraphCreate(&graph, 0));
+  for (int i = 0; i < kNodes; ++i) {
+    uint64_t count = i + 1 == kNodes ? 0 : delay;
+    void* output_arg = output;
+    hipKernelNodeParams params{};
+    params.func = reinterpret_cast<void*>(k_delay_set);
+    params.gridDim = dim3(1);
+    params.blockDim = dim3(1);
+    void* args[] = {&output_arg, &i, &count};
+    params.kernelParams = args;
+    hipGraphNode_t node{};
+    HIP_CHECK(hipGraphAddKernelNode(&node, graph, nullptr, 0, &params));
+  }
+
+  hipGraphExec_t exec{};
+  HIP_CHECK(hipGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
+  hipStream_t stream{};
+  HIP_CHECK(hipStreamCreate(&stream));
+  std::vector<int> host(kNodes);
+  for (int iteration = 0; iteration < kIterations; ++iteration) {
+    HIP_CHECK(hipMemsetAsync(output, 0, kNodes * sizeof(int), stream));
+    HIP_CHECK(hipGraphLaunch(exec, stream));
+    HIP_CHECK(
+        hipMemcpyAsync(host.data(), output, kNodes * sizeof(int), hipMemcpyDeviceToHost, stream));
+    HIP_CHECK(hipStreamSynchronize(stream));
+    REQUIRE(std::all_of(host.begin(), host.end(), [](int value) { return value == 1; }));
+  }
+
+  HIP_CHECK(hipStreamDestroy(stream));
+  HIP_CHECK(hipGraphExecDestroy(exec));
+  HIP_CHECK(hipGraphDestroy(graph));
+  HIP_CHECK(hipFree(output));
 }
