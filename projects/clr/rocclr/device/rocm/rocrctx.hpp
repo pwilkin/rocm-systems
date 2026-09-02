@@ -16,6 +16,7 @@
 #include "amd_hsa_signal.h"
 #include "hsa_ven_amd_loader.h"
 #include "hsa_ven_amd_aqlprofile.h"
+#include "hsa_ven_amd_graph.h"
 #else
 #include "hsa/hsa.h"
 #include "hsa/hsa_ext_image.h"
@@ -23,10 +24,22 @@
 #include "hsa/amd_hsa_signal.h"
 #include "hsa/hsa_ven_amd_loader.h"
 #include "hsa/hsa_ven_amd_aqlprofile.h"
+#include "hsa/hsa_ven_amd_graph.h"
 #endif
 
 typedef hsa_status_t HSA_API hsa_amd_queue_create_fn(
     hsa_agent_t agent, hsa_amd_queue_create_desc_t* descs, uint32_t num_descs);
+typedef decltype(hsa_ven_amd_graph_get_capabilities) hsa_ven_amd_graph_get_capabilities_fn;
+typedef decltype(hsa_ven_amd_graph_command_list_create)
+    hsa_ven_amd_graph_command_list_create_fn;
+typedef decltype(hsa_ven_amd_graph_command_list_destroy)
+    hsa_ven_amd_graph_command_list_destroy_fn;
+typedef decltype(hsa_ven_amd_graph_command_list_get_info)
+    hsa_ven_amd_graph_command_list_get_info_fn;
+typedef decltype(hsa_ven_amd_graph_command_list_materialize_packet)
+    hsa_ven_amd_graph_command_list_materialize_packet_fn;
+typedef decltype(hsa_ven_amd_graph_command_list_materialize_packet_for_queue)
+    hsa_ven_amd_graph_command_list_materialize_packet_for_queue_fn;
 
 namespace amd {
 namespace roc {
@@ -109,6 +122,14 @@ struct RocrEntryPoints {
   decltype(hsa_amd_register_system_event_handler)* hsa_amd_register_system_event_handler_;
   decltype(hsa_amd_queue_set_priority)* hsa_amd_queue_set_priority_;
   hsa_amd_queue_create_fn* hsa_amd_queue_create_;
+  hsa_ven_amd_graph_get_capabilities_fn* hsa_ven_amd_graph_get_capabilities_;
+  hsa_ven_amd_graph_command_list_create_fn* hsa_ven_amd_graph_command_list_create_;
+  hsa_ven_amd_graph_command_list_destroy_fn* hsa_ven_amd_graph_command_list_destroy_;
+  hsa_ven_amd_graph_command_list_get_info_fn* hsa_ven_amd_graph_command_list_get_info_;
+  hsa_ven_amd_graph_command_list_materialize_packet_fn*
+      hsa_ven_amd_graph_command_list_materialize_packet_;
+  hsa_ven_amd_graph_command_list_materialize_packet_for_queue_fn*
+      hsa_ven_amd_graph_command_list_materialize_packet_for_queue_;
   decltype(hsa_amd_memory_async_copy_rect)* hsa_amd_memory_async_copy_rect_;
   decltype(hsa_amd_memory_lock_to_pool)* hsa_amd_memory_lock_to_pool_;
   decltype(hsa_amd_signal_value_pointer)* hsa_amd_signal_value_pointer_;
@@ -199,6 +220,43 @@ class Hsa : public amd::AllStatic {
   static hsa_status_t amd_queue_get_info(hsa_queue_t* queue,
                                          hsa_queue_info_attribute_t attribute, void* value) {
     return ROCR_DYN(hsa_amd_queue_get_info)(queue, attribute, value);
+  }
+  static bool amd_graph_command_list_available() {
+#ifdef ROCR_DYN_DLL
+    return cep_.hsa_ven_amd_graph_get_capabilities_ != nullptr &&
+           cep_.hsa_ven_amd_graph_command_list_create_ != nullptr &&
+           cep_.hsa_ven_amd_graph_command_list_destroy_ != nullptr &&
+           cep_.hsa_ven_amd_graph_command_list_get_info_ != nullptr &&
+           cep_.hsa_ven_amd_graph_command_list_materialize_packet_ != nullptr &&
+           cep_.hsa_ven_amd_graph_command_list_materialize_packet_for_queue_ != nullptr;
+#else
+    return true;
+#endif
+  }
+  static hsa_status_t amd_graph_get_capabilities(
+      hsa_agent_t agent, hsa_ven_amd_graph_capabilities_t* capabilities) {
+    return ROCR_DYN(hsa_ven_amd_graph_get_capabilities)(agent, capabilities);
+  }
+  static hsa_status_t amd_graph_command_list_create(
+      hsa_agent_t agent, const hsa_ven_amd_graph_command_list_desc_t* desc,
+      hsa_ven_amd_graph_command_list_t* command_list) {
+    return ROCR_DYN(hsa_ven_amd_graph_command_list_create)(agent, desc, command_list);
+  }
+  static hsa_status_t amd_graph_command_list_destroy(
+      hsa_ven_amd_graph_command_list_t command_list) {
+    return ROCR_DYN(hsa_ven_amd_graph_command_list_destroy)(command_list);
+  }
+  static hsa_status_t amd_graph_command_list_get_info(
+      hsa_ven_amd_graph_command_list_t command_list,
+      hsa_ven_amd_graph_command_list_info_t attribute, void* value) {
+    return ROCR_DYN(hsa_ven_amd_graph_command_list_get_info)(command_list, attribute, value);
+  }
+  static hsa_status_t amd_graph_command_list_materialize_packet(
+      hsa_ven_amd_graph_command_list_t command_list, hsa_queue_t* queue,
+      hsa_fence_scope_t acquire_scope, hsa_fence_scope_t release_scope, uint32_t barrier,
+      hsa_signal_t completion_signal, hsa_ven_amd_graph_materialized_packet_t* packet) {
+    return ROCR_DYN(hsa_ven_amd_graph_command_list_materialize_packet_for_queue)(
+        command_list, queue, acquire_scope, release_scope, barrier, completion_signal, packet);
   }
   static uint64_t queue_load_read_index_scacquire(const hsa_queue_t* queue) {
     return ROCR_DYN(hsa_queue_load_read_index_scacquire)(queue);

@@ -15,6 +15,7 @@ subtrees:
   - caption: Contribution
     entries:
     - file: contribution/contributing-to-rocr
+    - file: contribution/retained-pm4-command-lists
 
   - caption: About
     entries:

@@ -40,6 +40,7 @@
 #include <map>
 #include <mutex>
 #include <list>
+#include <memory>
 #include <set>
 #include <unordered_set>
 #include <utility>
@@ -1287,6 +1288,16 @@ class ThreadTrace {
   ThreadTrace& operator=(const ThreadTrace&);
 };
 
+//! Backend-owned retained command stream for a captured graph packet batch.
+//!
+//! The HIP graph owns the shared pointer. Individual launches retain another
+//! reference through their completion command, so a graph update or destroy
+//! cannot free backend command memory while the GPU is still consuming it.
+class GraphPm4Batch {
+ public:
+  virtual ~GraphPm4Batch() = default;
+};
+
 //! A device execution environment.
 class VirtualDevice : public amd::ReferenceCountedObject {
  public:
@@ -1390,6 +1401,23 @@ class VirtualDevice : public amd::ReferenceCountedObject {
                                           bool pre_patched = false,
                                           bool blocking = false,
                                           const std::vector<uint8_t>* flatMetadataData = nullptr) {
+    return false;
+  }
+
+  //! Try to lower a fully captured graph batch into one retained backend PM4 IB.
+  //! Returning nullptr means the packet shape or device is unsupported and the
+  //! caller must retain the ordinary AQL path.
+  virtual std::shared_ptr<GraphPm4Batch> CreateGraphPm4Batch(
+      const amd::AlignedVector64<uint8_t>& flatPacketData,
+      const std::vector<uint32_t>& validFullHeaders) {
+    return nullptr;
+  }
+
+  //! Submit a retained graph PM4 IB through the stream's native queue.
+  virtual bool DispatchGraphPm4Batch(const std::shared_ptr<GraphPm4Batch>& batch,
+                                     amd::AccumulateCommand* vcmd,
+                                     bool attach_signal = false,
+                                     bool blocking = false) {
     return false;
   }
 

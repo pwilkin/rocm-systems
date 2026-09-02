@@ -261,5 +261,10 @@ performance:
   Performance_Graph_CollapseCorrectness: *level_2
   Performance_Graph_DisabledBoundarySynchronization: *level_2
   Performance_Graph_CollapsedIndependentCompletion: *level_2
+  Performance_Graph_RmwAndAsyncDestroy: *level_2
+  Performance_Graph_RmwUpdateAndDisable: *level_2
+  Performance_Graph_Pm4ConcurrentLaunchAndTrim: *level_2
+  Performance_Graph_Pm4QueueScratch: *level_2
+  Performance_Graph_Pm4QueueScratchConcurrentLaunchAndTrim: *level_2
   Performance_hipPerfSharedQueueAnyOrderOverlap: *level_2
   Performance_hipPerfSharedQueueAnyOrderOverlap_EventDependency: *level_2

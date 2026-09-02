@@ -811,6 +811,18 @@ set_tests_properties(intercept_queue_logic_test PROPERTIES
   LABELS "quick;standard;pr;pre-commit"
   TIMEOUT 60)
 
+set(GRAPH_COMMAND_ENCODER_TEST_ROOT "${ROCRTST_ROOT}/suites/functional/graph")
+add_executable(graph_command_encoder_test
+  ${GRAPH_COMMAND_ENCODER_TEST_ROOT}/graph_command_encoder_test.cc)
+target_include_directories(graph_command_encoder_test PRIVATE
+  ${HSA_RUNTIME_ROOT}
+  ${ROCRTST_ROOT}/gtest/include)
+target_link_libraries(graph_command_encoder_test ${GOOGLE_TEST_FRWK_NAME} pthread)
+add_test(NAME graph_command_encoder_test COMMAND graph_command_encoder_test)
+set_tests_properties(graph_command_encoder_test PROPERTIES
+  LABELS "quick;standard;pr;pre-commit"
+  TIMEOUT 60)
+
 #Build kernels
 add_custom_target(rocrtst_kernels ALL DEPENDS ${HSACO_TARG_LIST})
 
@@ -831,6 +843,8 @@ install(TARGETS ${ROCRTST}
         RUNTIME DESTINATION bin)
 
 install(TARGETS intercept_queue_logic_test
+        RUNTIME DESTINATION bin)
+install(TARGETS graph_command_encoder_test
         RUNTIME DESTINATION bin)
 
 # Install platform configuration file

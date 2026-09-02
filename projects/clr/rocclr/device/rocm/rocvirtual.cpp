@@ -1704,6 +1704,180 @@ bool VirtualGPU::dispatchAqlPacket(AqlPacket* packet, uint16_t header,
   }
 }
 // ================================================================================================
+namespace {
+
+class RocrGraphPm4Batch final : public amd::device::GraphPm4Batch {
+ public:
+  RocrGraphPm4Batch(const Device& device, hsa_ven_amd_graph_command_list_t command_list)
+      : device_(device), command_list_(command_list) {}
+
+  ~RocrGraphPm4Batch() override {
+    if (command_list_.handle != 0) {
+      Hsa::amd_graph_command_list_destroy(command_list_);
+    }
+  }
+
+  const Device& device() const { return device_; }
+
+  bool Materialize(hsa_queue_t* queue,
+                   hsa_ven_amd_graph_materialized_packet_t* packet) const {
+    return Hsa::amd_graph_command_list_materialize_packet(
+               command_list_, queue, HSA_FENCE_SCOPE_SYSTEM, HSA_FENCE_SCOPE_SYSTEM, 1,
+               hsa_signal_t{0}, packet) == HSA_STATUS_SUCCESS;
+  }
+
+ private:
+  const Device& device_;
+  hsa_ven_amd_graph_command_list_t command_list_;
+};
+
+}  // namespace
+
+std::shared_ptr<amd::device::GraphPm4Batch> VirtualGPU::CreateGraphPm4Batch(
+    const amd::AlignedVector64<uint8_t>& flatPacketData,
+    const std::vector<uint32_t>& validFullHeaders) {
+  if (!Hsa::amd_graph_command_list_available() || validFullHeaders.size() < 2 ||
+      flatPacketData.size() != validFullHeaders.size() * sizeof(hsa_kernel_dispatch_packet_t) ||
+      amd::activity_prof::IsEnabled(OP_ID_DISPATCH)) {
+    return nullptr;
+  }
+
+  hsa_ven_amd_graph_capabilities_t capabilities{};
+  capabilities.struct_size = sizeof(capabilities);
+  const bool allow_unqualified = DEBUG_HIP_GRAPH_PM4_UNQUALIFIED;
+  if (Hsa::amd_graph_get_capabilities(gpu_device_, &capabilities) != HSA_STATUS_SUCCESS ||
+      (capabilities.flags & HSA_VEN_AMD_GRAPH_CAPABILITY_COMPILE_SUPPORTED) == 0 ||
+      ((capabilities.flags & HSA_VEN_AMD_GRAPH_CAPABILITY_RUNTIME_QUALIFIED) == 0 &&
+       !allow_unqualified) ||
+      capabilities.encoder_family == HSA_VEN_AMD_GRAPH_ENCODER_NONE) {
+    return nullptr;
+  }
+
+  std::vector<hsa_kernel_dispatch_packet_t> packets(validFullHeaders.size());
+  std::vector<uint32_t> kernel_flags(validFullHeaders.size(), 0);
+  std::vector<hsa_ven_amd_graph_dependency_t> dependencies(
+      validFullHeaders.size() - 1, HSA_VEN_AMD_GRAPH_DEPENDENCY_SAME_AGENT_RMW);
+  for (size_t i = 0; i < validFullHeaders.size(); ++i) {
+    const uint16_t header = static_cast<uint16_t>(validFullHeaders[i]);
+    const uint8_t type =
+        extractAqlBits(header, HSA_PACKET_HEADER_TYPE, HSA_PACKET_HEADER_WIDTH_TYPE);
+    if (type != HSA_PACKET_TYPE_KERNEL_DISPATCH) {
+      return nullptr;
+    }
+    std::memcpy(&packets[i],
+                flatPacketData.data() + i * sizeof(hsa_kernel_dispatch_packet_t),
+                sizeof(hsa_kernel_dispatch_packet_t));
+    packets[i].header = header;
+    packets[i].setup = static_cast<uint16_t>(validFullHeaders[i] >> 16);
+    if (packets[i].completion_signal.handle != 0) {
+      return nullptr;
+    }
+    auto kernel_it = dev().KernelMap().find(packets[i].kernel_object);
+    if (kernel_it == dev().KernelMap().end()) {
+      return nullptr;
+    }
+    if (kernel_it->second.KernalHasDynamicCallStack()) {
+      kernel_flags[i] |= HSA_VEN_AMD_GRAPH_KERNEL_DYNAMIC_CALLSTACK;
+    }
+  }
+
+  hsa_ven_amd_graph_command_list_desc_t desc{};
+  desc.struct_size = sizeof(desc);
+  desc.packets = packets.data();
+  desc.packet_count = packets.size();
+  desc.dependencies = dependencies.data();
+  desc.dependency_count = dependencies.size();
+  desc.kernel_flags = kernel_flags.data();
+  desc.kernel_flag_count = kernel_flags.size();
+  if (allow_unqualified) {
+    desc.flags |= HSA_VEN_AMD_GRAPH_COMMAND_LIST_ALLOW_UNQUALIFIED;
+  }
+  hsa_ven_amd_graph_command_list_t command_list{};
+  const hsa_status_t create_status =
+      Hsa::amd_graph_command_list_create(gpu_device_, &desc, &command_list);
+  if (create_status != HSA_STATUS_SUCCESS) {
+    ClPrint(amd::LOG_INFO, amd::LOG_CODE,
+            "[hipGraph][PM4] ROCR command-list fallback for %zu packets: status=%d",
+            validFullHeaders.size(), create_status);
+    return nullptr;
+  }
+
+  uint32_t dwords = 0;
+  uint32_t dispatches = 0;
+  uint32_t max_private_segment_size = 0;
+  if (Hsa::amd_graph_command_list_get_info(
+          command_list, HSA_VEN_AMD_GRAPH_COMMAND_LIST_INFO_DWORD_COUNT, &dwords) !=
+          HSA_STATUS_SUCCESS ||
+      Hsa::amd_graph_command_list_get_info(
+          command_list, HSA_VEN_AMD_GRAPH_COMMAND_LIST_INFO_DISPATCH_COUNT,
+          &dispatches) != HSA_STATUS_SUCCESS ||
+      Hsa::amd_graph_command_list_get_info(
+          command_list, HSA_VEN_AMD_GRAPH_COMMAND_LIST_INFO_MAX_PRIVATE_SEGMENT_SIZE,
+          &max_private_segment_size) != HSA_STATUS_SUCCESS) {
+    Hsa::amd_graph_command_list_destroy(command_list);
+    return nullptr;
+  }
+  ClPrint(amd::LOG_INFO, amd::LOG_CODE,
+          "[hipGraph][PM4] retained %zu dispatches in %zu dwords, max private %u bytes",
+          static_cast<size_t>(dispatches), static_cast<size_t>(dwords),
+          max_private_segment_size);
+  return std::make_shared<RocrGraphPm4Batch>(dev(), command_list);
+}
+
+bool VirtualGPU::DispatchGraphPm4Batch(
+    const std::shared_ptr<amd::device::GraphPm4Batch>& batch, amd::AccumulateCommand* vcmd,
+    bool attach_signal, bool blocking) {
+  auto retained = std::dynamic_pointer_cast<RocrGraphPm4Batch>(batch);
+  if (retained == nullptr || &retained->device() != &dev() || vcmd == nullptr) {
+    return false;
+  }
+
+  hsa_ven_amd_graph_materialized_packet_t materialized{};
+  if (!retained->Materialize(gpu_queue_, &materialized)) {
+    return false;
+  }
+
+  std::scoped_lock lock(execution());
+  profilingBegin(*vcmd);
+  dispatchBlockingWait(nullptr);
+  hsa_ext_amd_aql_pm4_packet_t packet{};
+  std::memcpy(&packet, materialized.packet.bytes, sizeof(packet));
+  uint16_t header = static_cast<uint16_t>(materialized.full_header);
+  const bool requested_barrier = (header & kBarrierBit) != 0;
+  AqlSlotReservation reservation = ReserveAqlSlots(1);
+  const uint64_t index = reservation.start_slot;
+  if (requested_barrier) {
+    OptimizeStreamOrderingBarrier(header, reservation);
+  }
+  RecordAqlPacketHeader(reservation, 0, header);
+  CompleteAqlSubmission(reservation);
+
+  addSystemScope_ = false;
+  fence_state_ = amd::Device::kCacheStateSystem;
+  setFenceDirty(false);
+  const bool attachSignal = timestamp_ != nullptr || attach_signal || blocking;
+  packet.completion_signal =
+      Barriers().ActiveSignal(kInitSignalValueOne, timestamp_, attachSignal);
+
+  const uint32_t queue_mask = gpu_queue_->size - 1;
+  WaitForQueueSlot(index, queue_mask);
+  TrackQueueProgress(packet, index);
+  auto* slot = &reinterpret_cast<hsa_ext_amd_aql_pm4_packet_t*>(
+      gpu_queue_->base_address)[index & queue_mask];
+  const uint16_t vendor_header = static_cast<uint16_t>(materialized.full_header >> 16);
+  writePacketToRingBuffer(slot, &packet, header, vendor_header, index);
+  ringQueueDoorbell(index);
+  hasPendingDispatch_ = true;
+
+  bool status = true;
+  if (blocking && !Barriers().WaitCurrent()) {
+    status = false;
+  }
+  profilingEnd();
+  return status;
+}
+
+// ================================================================================================
 // Publish one metadata-prefetch packet (256B = 4 x 64B segments) to the metadata ring at |dst|.
 // |src| is the captured metadata packet with valid headers already baked into each segment
 // (INVALID for barrier/empty slots).  Each 64B segment carries its own header dword together

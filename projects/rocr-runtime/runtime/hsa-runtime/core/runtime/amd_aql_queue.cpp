@@ -774,6 +774,48 @@ void AqlQueue::CheckScratchLimits() {
   return;
 }
 
+hsa_status_t AqlQueue::GetGraphScratchState(
+    uint32_t private_wave32, uint32_t private_wave64,
+    uint32_t* compute_tmpring_size,
+    std::shared_ptr<std::atomic<uint32_t>>* scratch_users) {
+  if (compute_tmpring_size == nullptr || scratch_users == nullptr) {
+    return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+  }
+  *compute_tmpring_size = 0;
+  scratch_users->reset();
+  if (private_wave32 == 0 && private_wave64 == 0) {
+    return HSA_STATUS_SUCCESS;
+  }
+
+  std::lock_guard<std::mutex> lock(scratch_lock_);
+  const auto& scratch = queue_scratch_;
+  if (!active_.load(std::memory_order_acquire) || scratch.main_queue_base == nullptr ||
+      scratch.main_size == 0 || scratch.main_size_per_thread == 0 ||
+      scratch.main_lanes_per_wave == 0 || scratch.large ||
+      amd_queue_.compute_tmpring_size == 0) {
+    return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
+  }
+
+  const uint64_t available_per_wave =
+      AlignUp(static_cast<uint64_t>(scratch.main_size_per_thread) *
+                  scratch.main_lanes_per_wave,
+              static_cast<uint64_t>(scratch.mem_alignment_size));
+  const uint64_t required_wave32 =
+      AlignUp(static_cast<uint64_t>(private_wave32) * 32,
+              static_cast<uint64_t>(scratch.mem_alignment_size));
+  const uint64_t required_wave64 =
+      AlignUp(static_cast<uint64_t>(private_wave64) * 64,
+              static_cast<uint64_t>(scratch.mem_alignment_size));
+  if (required_wave32 > available_per_wave || required_wave64 > available_per_wave) {
+    return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
+  }
+
+  *compute_tmpring_size = amd_queue_.compute_tmpring_size;
+  *scratch_users = retained_graph_scratch_;
+  retained_graph_scratch_->fetch_add(1, std::memory_order_acq_rel);
+  return HSA_STATUS_SUCCESS;
+}
+
 void AqlQueue::FreeMainScratchSpace() {
   auto& scratch = queue_scratch_;
   if (queue_scratch_.main_queue_base) {
@@ -885,13 +927,16 @@ void AqlQueue::AsyncReclaimMainScratch() {
     return;
   }
 
+  std::lock_guard<std::mutex> lock(scratch_lock_);
+  if (retained_graph_scratch_->load(std::memory_order_acquire) != 0) {
+    return;
+  }
+
   assert((amd_queue_.caps & AMD_QUEUE_CAPS_CP_ASYNC_RECLAIM) &&
           "This version of CP FW should support async scratch, but flag is not set");
 
   tool::notify_event_scratch_async_reclaim_start(public_handle(),
                                                  HSA_AMD_EVENT_SCRATCH_ALLOC_FLAG_NONE);
-
-  std::lock_guard<std::mutex> lock(scratch_lock_);
 
   // Unmap the queue. CP will check amd_queue_ fields on re-map
   Suspend();

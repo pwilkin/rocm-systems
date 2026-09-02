@@ -247,6 +247,10 @@ release(uint, DEBUG_HIP_GRAPH_BATCH_SIZE, 256,                                \
         "Number of graph nodes to batch at a time")                           \
 release(bool, DEBUG_HIP_GRAPH_MERGE_COLLAPSED, false,                         \
         "Merge fully captured single-stream graph segments")                 \
+release(bool, DEBUG_HIP_GRAPH_PM4, false,                                    \
+        "Lower supported single-stream graph batches to retained PM4")       \
+release(bool, DEBUG_HIP_GRAPH_PM4_UNQUALIFIED, false,                        \
+        "Allow retained PM4 on compile-supported but unqualified ASICs")    \
 release(uint, DEBUG_HIP_GRAPH_SEGMENT_SCHEDULING, 0,                          \
         "Segment scheduling mode (segmented path only): "                      \
         "0=Hybrid/auto, 1=Round-robin, 2=DFS")                                \

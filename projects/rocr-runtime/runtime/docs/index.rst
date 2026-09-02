@@ -30,6 +30,7 @@ The documentation is structured as follows:
   .. grid-item-card:: Contribution
 
     * :ref:`contributing-to-rocr`
+    * :ref:`retained-pm4-command-lists`
 
 To contribute to the documentation, refer to
 `Contributing to ROCm  <https://rocm.docs.amd.com/en/latest/contribute/contributing.html>`_.

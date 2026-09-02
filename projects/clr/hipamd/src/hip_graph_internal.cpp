@@ -5,6 +5,7 @@
  */
 
 #include "hip_graph_internal.hpp"
+#include "platform/activity.hpp"
 
 #include <hsa/hsa.h>
 
@@ -2529,6 +2530,11 @@ void GraphExecSegmented::EndAQLPacketUpdates() {
 }
 
 void GraphExecSegmented::RebuildAQLPacketBatch(PacketBatch& packetBatch) {
+  {
+    std::lock_guard<std::mutex> lock(packetBatch.pm4Cache->lock);
+    packetBatch.pm4Cache->batch.reset();
+    packetBatch.pm4Cache->rejected = false;
+  }
   packetBatch.rebuildFlatBuffer();
   packetBatch.restorePatchListPointers(sync_plan_.patch_list);
   if (packetBatch.disabledNodeCount > 0) {
@@ -2860,8 +2866,31 @@ hipError_t GraphExecSegmented::EnqueueSegment(const Segment& segment, hip::Strea
     }
 
     if (!flatData->empty()) {
-      bool batchStatus = stream->vdev()->dispatchAqlPacketBatchFlat(
-          *flatData, *flatHdrs, accumulate, attach_signal, true, false, metaData);
+      bool batchStatus = false;
+      bool usedPm4 = false;
+      if (DEBUG_HIP_GRAPH_PM4 && packetBatch.disabledNodeCount == 0 &&
+          !amd::activity_prof::IsEnabled(OP_ID_DISPATCH)) {
+        std::shared_ptr<amd::device::GraphPm4Batch> retained;
+        {
+          std::lock_guard<std::mutex> lock(packetBatch.pm4Cache->lock);
+          if (packetBatch.pm4Cache->batch == nullptr && !packetBatch.pm4Cache->rejected) {
+            packetBatch.pm4Cache->batch =
+                stream->vdev()->CreateGraphPm4Batch(*flatData, *flatHdrs);
+            packetBatch.pm4Cache->rejected = packetBatch.pm4Cache->batch == nullptr;
+          }
+          retained = packetBatch.pm4Cache->batch;
+        }
+        if (retained != nullptr) {
+          accumulate->retainGraphPm4Batch(retained);
+          batchStatus = stream->vdev()->DispatchGraphPm4Batch(
+              retained, accumulate, attach_signal, false);
+          usedPm4 = batchStatus;
+        }
+      }
+      if (!usedPm4) {
+        batchStatus = stream->vdev()->dispatchAqlPacketBatchFlat(
+            *flatData, *flatHdrs, accumulate, attach_signal, true, false, metaData);
+      }
       if (!batchStatus) {
         return hipErrorUnknown;
       }

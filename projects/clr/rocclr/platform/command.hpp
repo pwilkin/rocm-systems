@@ -1746,6 +1746,8 @@ class AccumulateCommand : public Command {
   //! When false, the destructor does not destroy hw_events_ (an external owner,
   //! e.g. the graph signal pool, reclaims them instead).
   bool owns_hw_events_ = true;
+  //! Keep retained graph command buffers alive until this launch completes.
+  std::vector<std::shared_ptr<device::GraphPm4Batch>> graph_pm4_batches_;
 
  public:
   AccumulateCommand(HostQueue& queue, const EventWaitList& eventWaitList = nullWaitList,
@@ -1777,6 +1779,12 @@ class AccumulateCommand : public Command {
   //! Set to false when an external owner (e.g. the graph signal pool) recycles
   //! them across launches instead.
   void setOwnsHwEvents(bool owns) { owns_hw_events_ = owns; }
+
+  void retainGraphPm4Batch(const std::shared_ptr<device::GraphPm4Batch>& batch) {
+    if (batch != nullptr) {
+      graph_pm4_batches_.push_back(batch);
+    }
+  }
 
   //! Reserve one graph kernel dispatch slot and return its index. |name| must
   //! not be nullptr — use "<unknown>" when it cannot be resolved.

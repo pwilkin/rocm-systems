@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -58,6 +59,30 @@ __global__ void k_delay_set(int* output, int index, uint64_t count) {
   }
 #endif
   output[index] = 1;
+}
+
+__global__ void k_increment(int* value) { value[0] = value[0] + 1; }
+
+__global__ void k_add_value(int* value, int addend) { value[0] = value[0] + addend; }
+
+__global__ void k_atomic_increment(int* value) { atomicAdd(value, 1); }
+
+__global__ void k_private_increment(int* value, int selector) {
+  volatile int scratch[8];
+  const int slot = (selector + static_cast<int>(threadIdx.x)) & 7;
+  scratch[slot] = value[0] + 1;
+  if (threadIdx.x == 0) {
+    value[0] = scratch[slot];
+  }
+}
+
+__global__ void k_private_atomic_increment(int* value, int selector) {
+  volatile int scratch[8];
+  const int slot = (selector + static_cast<int>(threadIdx.x)) & 7;
+  scratch[slot] = 1;
+  if (threadIdx.x == 0) {
+    atomicAdd(value, scratch[slot]);
+  }
 }
 
 hipGraphNode_t AddKernel(hipGraph_t graph, std::vector<hipGraphNode_t> deps,
@@ -267,4 +292,288 @@ TEST_CASE("Performance_Graph_CollapsedIndependentCompletion") {
   HIP_CHECK(hipGraphExecDestroy(exec));
   HIP_CHECK(hipGraphDestroy(graph));
   HIP_CHECK(hipFree(output));
+}
+
+TEST_CASE("Performance_Graph_RmwAndAsyncDestroy") {
+  constexpr int kNodes = 512;
+  constexpr int kLaunches = 64;
+
+  int* device_value = nullptr;
+  HIP_CHECK(hipMalloc(&device_value, sizeof(*device_value)));
+
+  hipGraph_t graph{};
+  HIP_CHECK(hipGraphCreate(&graph, 0));
+  hipGraphNode_t dependency = nullptr;
+  void* value_arg = device_value;
+  void* kernel_args[] = {&value_arg};
+  hipKernelNodeParams params{};
+  params.func = reinterpret_cast<void*>(k_increment);
+  params.gridDim = dim3(1);
+  params.blockDim = dim3(1);
+  params.kernelParams = kernel_args;
+
+  for (int i = 0; i < kNodes; ++i) {
+    hipGraphNode_t node{};
+    HIP_CHECK(hipGraphAddKernelNode(&node, graph, dependency ? &dependency : nullptr,
+                                    dependency ? 1 : 0, &params));
+    dependency = node;
+  }
+
+  hipGraphExec_t exec{};
+  HIP_CHECK(hipGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
+  hipStream_t stream{};
+  HIP_CHECK(hipStreamCreate(&stream));
+  HIP_CHECK(hipMemsetAsync(device_value, 0, sizeof(*device_value), stream));
+
+  for (int i = 0; i < kLaunches; ++i) {
+    HIP_CHECK(hipGraphLaunch(exec, stream));
+  }
+
+  // Queued graph work must remain valid through the following ordered copy.
+  HIP_CHECK(hipGraphExecDestroy(exec));
+  HIP_CHECK(hipGraphDestroy(graph));
+
+  int host_value = 0;
+  HIP_CHECK(
+      hipMemcpyAsync(&host_value, device_value, sizeof(host_value), hipMemcpyDeviceToHost, stream));
+  HIP_CHECK(hipStreamSynchronize(stream));
+  REQUIRE(host_value == kNodes * kLaunches);
+
+  HIP_CHECK(hipStreamDestroy(stream));
+  HIP_CHECK(hipFree(device_value));
+}
+
+TEST_CASE("Performance_Graph_RmwUpdateAndDisable") {
+  constexpr int kNodes = 128;
+  constexpr int kIterations = 32;
+  constexpr int kUpdatedNode = kNodes / 2;
+
+  int* device_value = nullptr;
+  HIP_CHECK(hipMalloc(&device_value, sizeof(*device_value)));
+
+  hipGraph_t graph{};
+  HIP_CHECK(hipGraphCreate(&graph, 0));
+  std::vector<hipGraphNode_t> nodes;
+  nodes.reserve(kNodes);
+  hipGraphNode_t dependency = nullptr;
+  void* value_arg = device_value;
+  int addend = 1;
+  void* kernel_args[] = {&value_arg, &addend};
+  hipKernelNodeParams params{};
+  params.func = reinterpret_cast<void*>(k_add_value);
+  params.gridDim = dim3(1);
+  params.blockDim = dim3(1);
+  params.kernelParams = kernel_args;
+
+  for (int i = 0; i < kNodes; ++i) {
+    hipGraphNode_t node{};
+    HIP_CHECK(hipGraphAddKernelNode(&node, graph, dependency ? &dependency : nullptr,
+                                    dependency ? 1 : 0, &params));
+    nodes.push_back(node);
+    dependency = node;
+  }
+
+  hipGraphExec_t exec{};
+  HIP_CHECK(hipGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
+  hipStream_t stream{};
+  HIP_CHECK(hipStreamCreate(&stream));
+
+  auto run_and_check = [&](int expected) {
+    for (int iteration = 0; iteration < kIterations; ++iteration) {
+      HIP_CHECK(hipMemsetAsync(device_value, 0, sizeof(*device_value), stream));
+      HIP_CHECK(hipGraphLaunch(exec, stream));
+      int actual = 0;
+      HIP_CHECK(hipMemcpyAsync(&actual, device_value, sizeof(actual), hipMemcpyDeviceToHost,
+                               stream));
+      HIP_CHECK(hipStreamSynchronize(stream));
+      REQUIRE(actual == expected);
+    }
+  };
+
+  run_and_check(kNodes);
+
+  int updated_addend = 7;
+  void* updated_args[] = {&value_arg, &updated_addend};
+  hipKernelNodeParams updated_params = params;
+  updated_params.kernelParams = updated_args;
+  HIP_CHECK(hipGraphExecKernelNodeSetParams(exec, nodes[kUpdatedNode], &updated_params));
+  run_and_check(kNodes + updated_addend - addend);
+
+  HIP_CHECK(hipGraphNodeSetEnabled(exec, nodes[kUpdatedNode], 0));
+  run_and_check(kNodes - 1);
+  HIP_CHECK(hipGraphNodeSetEnabled(exec, nodes[kUpdatedNode], 1));
+  run_and_check(kNodes + updated_addend - addend);
+
+  HIP_CHECK(hipStreamDestroy(stream));
+  HIP_CHECK(hipGraphExecDestroy(exec));
+  HIP_CHECK(hipGraphDestroy(graph));
+  HIP_CHECK(hipFree(device_value));
+}
+
+TEST_CASE("Performance_Graph_Pm4ConcurrentLaunchAndTrim") {
+  constexpr int kNodes = 64;
+  constexpr int kLaunches = 32;
+
+  int* device_value = nullptr;
+  HIP_CHECK(hipMalloc(&device_value, sizeof(*device_value)));
+  HIP_CHECK(hipMemset(device_value, 0, sizeof(*device_value)));
+
+  hipGraph_t graph{};
+  HIP_CHECK(hipGraphCreate(&graph, 0));
+  hipGraphNode_t dependency = nullptr;
+  void* value_arg = device_value;
+  void* kernel_args[] = {&value_arg};
+  hipKernelNodeParams params{};
+  params.func = reinterpret_cast<void*>(k_atomic_increment);
+  params.gridDim = dim3(1);
+  params.blockDim = dim3(1);
+  params.kernelParams = kernel_args;
+  for (int i = 0; i < kNodes; ++i) {
+    hipGraphNode_t node{};
+    HIP_CHECK(hipGraphAddKernelNode(&node, graph, dependency ? &dependency : nullptr,
+                                    dependency ? 1 : 0, &params));
+    dependency = node;
+  }
+
+  hipGraphExec_t exec{};
+  HIP_CHECK(hipGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
+  hipStream_t streams[2]{};
+  HIP_CHECK(hipStreamCreate(&streams[0]));
+  HIP_CHECK(hipStreamCreate(&streams[1]));
+
+  for (int i = 0; i < kLaunches; ++i) {
+    HIP_CHECK(hipGraphLaunch(exec, streams[i & 1]));
+  }
+  hipError_t trim_status = hipSuccess;
+  std::thread trimmer([&] {
+    for (int i = 0; i < 16; ++i) {
+      const hipError_t status = hipDeviceGraphMemTrim(0);
+      if (status != hipSuccess) {
+        trim_status = status;
+        return;
+      }
+    }
+  });
+
+  HIP_CHECK(hipGraphExecDestroy(exec));
+  HIP_CHECK(hipGraphDestroy(graph));
+  trimmer.join();
+  HIP_CHECK(trim_status);
+  HIP_CHECK(hipStreamSynchronize(streams[0]));
+  HIP_CHECK(hipStreamSynchronize(streams[1]));
+
+  int actual = 0;
+  HIP_CHECK(hipMemcpy(&actual, device_value, sizeof(actual), hipMemcpyDeviceToHost));
+  REQUIRE(actual == kNodes * kLaunches);
+
+  HIP_CHECK(hipStreamDestroy(streams[0]));
+  HIP_CHECK(hipStreamDestroy(streams[1]));
+  HIP_CHECK(hipFree(device_value));
+}
+
+TEST_CASE("Performance_Graph_Pm4QueueScratch") {
+  constexpr int kNodes = 8;
+
+  hipFuncAttributes attributes{};
+  HIP_CHECK(hipFuncGetAttributes(&attributes,
+                                 reinterpret_cast<const void*>(k_private_increment)));
+  INFO("private bytes=" << attributes.localSizeBytes);
+  REQUIRE(attributes.localSizeBytes > 0);
+
+  int* device_value = nullptr;
+  HIP_CHECK(hipMalloc(&device_value, sizeof(*device_value)));
+  HIP_CHECK(hipMemset(device_value, 0, sizeof(*device_value)));
+
+  hipGraph_t graph{};
+  HIP_CHECK(hipGraphCreate(&graph, 0));
+  hipGraphNode_t dependency = nullptr;
+  void* value_arg = device_value;
+  int selector = 3;
+  void* kernel_args[] = {&value_arg, &selector};
+  hipKernelNodeParams params{};
+  params.func = reinterpret_cast<void*>(k_private_increment);
+  params.gridDim = dim3(1);
+  params.blockDim = dim3(32);
+  params.kernelParams = kernel_args;
+  for (int i = 0; i < kNodes; ++i) {
+    hipGraphNode_t node{};
+    HIP_CHECK(hipGraphAddKernelNode(&node, graph, dependency ? &dependency : nullptr,
+                                    dependency ? 1 : 0, &params));
+    dependency = node;
+  }
+
+  hipGraphExec_t exec{};
+  HIP_CHECK(hipGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
+  hipStream_t stream{};
+  HIP_CHECK(hipStreamCreate(&stream));
+  HIP_CHECK(hipGraphLaunch(exec, stream));
+
+  int actual = 0;
+  HIP_CHECK(hipMemcpyAsync(&actual, device_value, sizeof(actual), hipMemcpyDeviceToHost,
+                           stream));
+  HIP_CHECK(hipStreamSynchronize(stream));
+  REQUIRE(actual == kNodes);
+
+  HIP_CHECK(hipStreamDestroy(stream));
+  HIP_CHECK(hipGraphExecDestroy(exec));
+  HIP_CHECK(hipGraphDestroy(graph));
+  HIP_CHECK(hipFree(device_value));
+}
+
+TEST_CASE("Performance_Graph_Pm4QueueScratchConcurrentLaunchAndTrim") {
+  constexpr int kNodes = 32;
+  constexpr int kLaunches = 16;
+
+  hipFuncAttributes attributes{};
+  HIP_CHECK(hipFuncGetAttributes(
+      &attributes, reinterpret_cast<const void*>(k_private_atomic_increment)));
+  REQUIRE(attributes.localSizeBytes > 0);
+
+  int* device_value = nullptr;
+  HIP_CHECK(hipMalloc(&device_value, sizeof(*device_value)));
+  HIP_CHECK(hipMemset(device_value, 0, sizeof(*device_value)));
+
+  hipGraph_t graph{};
+  HIP_CHECK(hipGraphCreate(&graph, 0));
+  hipGraphNode_t dependency = nullptr;
+  void* value_arg = device_value;
+  int selector = 5;
+  void* kernel_args[] = {&value_arg, &selector};
+  hipKernelNodeParams params{};
+  params.func = reinterpret_cast<void*>(k_private_atomic_increment);
+  params.gridDim = dim3(1);
+  params.blockDim = dim3(32);
+  params.kernelParams = kernel_args;
+  for (int i = 0; i < kNodes; ++i) {
+    hipGraphNode_t node{};
+    HIP_CHECK(hipGraphAddKernelNode(&node, graph, dependency ? &dependency : nullptr,
+                                    dependency ? 1 : 0, &params));
+    dependency = node;
+  }
+
+  hipGraphExec_t exec{};
+  HIP_CHECK(hipGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
+  hipStream_t streams[2]{};
+  HIP_CHECK(hipStreamCreate(&streams[0]));
+  HIP_CHECK(hipStreamCreate(&streams[1]));
+  for (int i = 0; i < kLaunches; ++i) {
+    HIP_CHECK(hipGraphLaunch(exec, streams[i & 1]));
+  }
+
+  hipError_t trim_status = hipSuccess;
+  std::thread trimmer([&] { trim_status = hipDeviceGraphMemTrim(0); });
+  HIP_CHECK(hipGraphExecDestroy(exec));
+  HIP_CHECK(hipGraphDestroy(graph));
+  trimmer.join();
+  HIP_CHECK(trim_status);
+  HIP_CHECK(hipStreamSynchronize(streams[0]));
+  HIP_CHECK(hipStreamSynchronize(streams[1]));
+
+  int actual = 0;
+  HIP_CHECK(hipMemcpy(&actual, device_value, sizeof(actual), hipMemcpyDeviceToHost));
+  REQUIRE(actual == kNodes * kLaunches);
+
+  HIP_CHECK(hipStreamDestroy(streams[0]));
+  HIP_CHECK(hipStreamDestroy(streams[1]));
+  HIP_CHECK(hipFree(device_value));
 }

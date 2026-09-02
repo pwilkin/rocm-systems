@@ -282,6 +282,12 @@ global:
 	hsa_amd_vmem_export_fabric_handle;
 	hsa_amd_vmem_import_fabric_handle;
 	hsa_amd_svm_discard_and_prefetch_batch_async;
+	hsa_ven_amd_graph_get_capabilities;
+	hsa_ven_amd_graph_command_list_create;
+	hsa_ven_amd_graph_command_list_destroy;
+	hsa_ven_amd_graph_command_list_get_info;
+	hsa_ven_amd_graph_command_list_materialize_packet;
+	hsa_ven_amd_graph_command_list_materialize_packet_for_queue;
 local:
     *;
 };
