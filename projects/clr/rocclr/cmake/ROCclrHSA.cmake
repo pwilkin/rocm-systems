@@ -49,6 +49,9 @@ else()
         cmake/hsa-runtime64
         lib/cmake/hsa-runtime64
         lib64/cmake/hsa-runtime64)
+    get_target_property(HSA_RUNTIME_INCLUDE_DIRS hsa-runtime64::hsa-runtime64
+                        INTERFACE_INCLUDE_DIRECTORIES)
+    target_include_directories(rocclr BEFORE PUBLIC ${HSA_RUNTIME_INCLUDE_DIRS})
   else()
     find_package(hsa-runtime64 1.11 REQUIRED CONFIG
       PATHS
